@@ -90,6 +90,32 @@ fn check_admin_rights() -> bool {
     false
 }
 
+#[derive(Deserialize, Debug)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+fn check_updates(current_version: &str) -> Option<String> {
+    
+    let url = "https://api.github.com/repos/Ne0less/AdminHelper/releases/latest";
+    
+    let client = reqwest::blocking::Client::new();
+    let res = client.get(url)
+        .header("User-Agent", "AdminHelper") 
+        .send();
+
+    if let Ok(response) = res {
+        if let Ok(release) = response.json::<GithubRelease>() {
+            let server_ver = release.tag_name.trim_start_matches('v');
+            if server_ver != current_version {
+                return Some(release.html_url);
+            }
+        }
+    }
+    None
+}
+
 
 pub fn restore_application_window(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
