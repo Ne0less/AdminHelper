@@ -17,6 +17,9 @@ use chrono::{Local, Timelike, Datelike};
 use arboard::Clipboard; 
 use rdev::{listen, Event, EventType}; 
 use std::collections::HashMap;
+use reqwest; // Используем reqwest, как в твоем коде
+use open;
+use image; 
 
 #[cfg(target_os = "windows")]
 use std::mem::size_of;
@@ -44,6 +47,9 @@ extern "system" {
     fn SwitchToThisWindow(hwnd: winapi::shared::windef::HWND, fAltTab: winapi::shared::minwindef::BOOL);
 }
 
+// Дубликаты импортов ureq/open/image убрал, оставил верхние
+mod auth; 
+use auth::AuthStatus;
 mod data;
 use data::{Organization, Teleport};
 
@@ -88,32 +94,6 @@ fn check_admin_rights() -> bool {
         }
     }
     false
-}
-
-#[derive(Deserialize, Debug)]
-struct GithubRelease {
-    tag_name: String,
-    html_url: String,
-}
-
-fn check_updates(current_version: &str) -> Option<String> {
-    
-    let url = "https://api.github.com/repos/Ne0less/AdminHelper/releases/latest";
-    
-    let client = reqwest::blocking::Client::new();
-    let res = client.get(url)
-        .header("User-Agent", "AdminHelper") 
-        .send();
-
-    if let Ok(response) = res {
-        if let Ok(release) = response.json::<GithubRelease>() {
-            let server_ver = release.tag_name.trim_start_matches('v');
-            if server_ver != current_version {
-                return Some(release.html_url);
-            }
-        }
-    }
-    None
 }
 
 
@@ -452,7 +432,6 @@ fn input_to_bind_string(key: egui::Key, modifiers: egui::Modifiers) -> String {
 }
 
 fn load_rules() -> Vec<Rule> {
-    
     let rules_json = include_str!("../rules.json"); 
     serde_json::from_str(rules_json).unwrap_or_default()
 }
@@ -461,7 +440,6 @@ fn load_config() -> AppConfig {
     match fs::read_to_string("config.json") {
         Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
         Err(_) => {
-            
             let cfg = AppConfig::default();
             save_config(&cfg); 
             cfg
@@ -501,33 +479,25 @@ fn apply_theme(ctx: &egui::Context, theme_index: usize) {
         _ => egui::Color32::from_rgb(100, 200, 255),
     };
 
-    
     visuals.extreme_bg_color = if theme_index == 1 {
         egui::Color32::from_gray(245) 
     } else {
         egui::Color32::from_gray(30) 
     };
 
-   
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(80)); 
     visuals.widgets.inactive.rounding = egui::Rounding::same(4.0); 
 
-    
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, accent_color);
     visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
-    
     visuals.widgets.hovered.weak_bg_fill = if theme_index == 1 { egui::Color32::from_gray(230) } else { egui::Color32::from_gray(50) };
 
-   
     visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0, accent_color);
     visuals.widgets.active.rounding = egui::Rounding::same(4.0);
     visuals.widgets.active.bg_fill = accent_color.linear_multiply(0.2); 
 
-    
     visuals.selection.bg_fill = accent_color;
     visuals.hyperlink_color = accent_color;
-    
-    
     visuals.widgets.open.bg_fill = accent_color;
     
     if theme_index == 1 { 
@@ -614,7 +584,48 @@ enum HotkeyAction {
     Reload,
 }
 
+// Структура для ответа от GitHub
+#[derive(Deserialize, Debug)]
+struct GithubRelease {
+    tag_name: String, 
+    html_url: String, 
+}
+
+
+fn check_updates(current_version: &str) -> Option<String> {
+    let url = "https://api.github.com/repos/Ne0less/AdminHelper/releases/latest";
+    
+    let client = reqwest::blocking::Client::new();
+    let res = client.get(url)
+        .header("User-Agent", "AdminHelperApp") 
+        .send();
+
+    if let Ok(response) = res {
+        if let Ok(release) = response.json::<GithubRelease>() {
+            let server_ver = release.tag_name.trim_start_matches('v');
+            if server_ver != current_version {
+                return Some(release.html_url); 
+            }
+        }
+    }
+    None
+}
+
+// === НОВОЕ: СОСТОЯНИЕ ПРИЛОЖЕНИЯ ===
+#[derive(PartialEq)]
+enum AppState {
+    Login,
+    Main,
+}
+
 struct MyApp {
+    // === НОВЫЕ ПОЛЯ ДЛЯ ВХОДА ===
+    state: AppState,
+    login_user: String,
+    login_pass: String,
+    login_status: String,
+
+    // === СТАРЫЕ ПОЛЯ ===
     config: AppConfig,
     rules: Vec<Rule>,
     orgs: Vec<Organization>,
@@ -649,6 +660,8 @@ struct MyApp {
     is_mp_running: Arc<AtomicBool>,
     waiting_for_key: Option<BindAction>,
     is_admin: bool, 
+    update_url: Arc<Mutex<Option<String>>>,
+    version: String,                      
 }
 
 impl MyApp {
@@ -662,6 +675,7 @@ impl MyApp {
         let config = load_config();
         let (saved_seconds, last_day) = Self::load_timer();
         
+        // --- ЗАГРУЗКА АВТОЗАМЕН ---
         let raw_data = data::get_auto_replacements();
         let mut combined_replacements = Vec::new();
         for (label, text) in raw_data {
@@ -681,6 +695,24 @@ impl MyApp {
         let (tx_action, rx_action) = mpsc::channel::<HotkeyAction>();
         let initial_config = config.clone();
         let ctx_clone = cc.egui_ctx.clone();
+
+        
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        let update_url = Arc::new(Mutex::new(None));
+        
+        
+        let update_url_clone = update_url.clone();
+        let ver_clone = current_version.clone();
+        
+        
+        thread::spawn(move || {
+            if let Some(url) = check_updates(&ver_clone) {
+                if let Ok(mut u) = update_url_clone.lock() {
+                    *u = Some(url);
+                }
+            }
+        }); 
+        // ==================================================
 
         thread::spawn(move || {
             log("Hotkey Thread: Started.");
@@ -753,6 +785,10 @@ impl MyApp {
         let start_tab = if config.admin_name.is_empty() { MainTab::Setup } else { MainTab::InfoF6 };
 
         Self {
+            state: AppState::Login, // <-- НАЧИНАЕМ С ЭКРАНА ВХОДА
+            login_user: String::new(),
+            login_pass: String::new(),
+            login_status: String::new(),
             config,
             rules: load_rules(),
             orgs: data::get_organizations(),
@@ -787,6 +823,8 @@ impl MyApp {
             is_mp_running: Arc::new(AtomicBool::new(false)),
             waiting_for_key: None,
             is_admin,
+            update_url,          
+            version: current_version, 
         }
     }
 
@@ -876,22 +914,7 @@ impl eframe::App for MyApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, self.config.theme_mode);
-        ctx.request_repaint_after(Duration::from_millis(100));
-        self.check_daily_reset();
-
-        while let Ok(action) = self.action_receiver.try_recv() {
-            log(&format!("[UI] Switching tab to: {:?}", action));
-            match action {
-                HotkeyAction::MainMenu => self.current_tab = MainTab::InfoF6,
-                HotkeyAction::PunishMenu => self.current_tab = MainTab::PunishF7,
-                HotkeyAction::EventsMenu => self.current_tab = MainTab::TeleportF8,
-                HotkeyAction::MpMenu => self.current_tab = MainTab::MpF9,
-                HotkeyAction::Reload => restart_app(),
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-
+        
         let accent_color = match self.config.theme_mode {
             0 => egui::Color32::from_rgb(100, 200, 255),
             1 => egui::Color32::from_rgb(0, 120, 255),
@@ -905,719 +928,830 @@ impl eframe::App for MyApp {
             _ => egui::Color32::from_rgb(100, 200, 255),
         };
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("🛡 AdminHelper").strong().color(accent_color).size(16.0));
-                ui.separator();
-                ui.selectable_value(&mut self.current_tab, MainTab::InfoF6, "Меню");
-                ui.selectable_value(&mut self.current_tab, MainTab::PunishF7, "Наказания");
-                ui.selectable_value(&mut self.current_tab, MainTab::TeleportF8, "События");
-                ui.selectable_value(&mut self.current_tab, MainTab::MpF9, "Мероприятие");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ Настройки").clicked() { self.current_tab = MainTab::Setup; }
-                });
-                ui.selectable_value(&mut self.current_tab, MainTab::Logs, "🐞 Логи");
-            });
-        });
+        // === ГЛАВНАЯ ЛОГИКА: ЛОГИН ИЛИ ОСНОВНОЕ ОКНО ===
+        match self.state {
+            AppState::Login => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(50.0);
+                        ui.heading(egui::RichText::new("🔐 Авторизация").size(30.0).color(accent_color));
+                        ui.add_space(20.0);
+                        
+                        ui.label("Введите логин и пароль от базы данных");
+                        ui.add_space(10.0);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(action) = self.waiting_for_key {
-                let mut captured = None;
-                ctx.input(|i| {
-                    for event in &i.events {
-                        if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
-                            let bind_str = input_to_bind_string(*key, *modifiers);
-                            if bind_str != "UNKNOWN" { 
-                                captured = Some(bind_str); 
-                                break; 
+                        ui.horizontal(|ui| {
+                            ui.label("Логин: ");
+                            ui.text_edit_singleline(&mut self.login_user);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Пароль:");
+                            ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true));
+                        });
+
+                        ui.add_space(20.0);
+
+                        if ui.button("Войти").clicked() {
+                            self.login_status = "Подключение...".to_string();
+                            // В реальном приложении это нужно делать асинхронно, 
+                            // но для простоты делаем синхронно (может подвиснуть на секунду)
+                            let status = auth::try_login(&self.login_user, &self.login_pass);
+                            
+                            match status {
+                                AuthStatus::Success(_) => {
+                                    self.state = AppState::Main; // ПУСКАЕМ В ПРОГРАММУ
+                                    self.config.admin_name = self.login_user.clone();
+                                    save_config(&self.config);
+                                },
+                                AuthStatus::WrongCredentials => self.login_status = "❌ Неверный логин или пароль".to_string(),
+                                AuthStatus::HwidMismatch => self.login_status = "⛔ HWID не совпадает! (Чужой ПК)".to_string(),
+                                AuthStatus::Banned(reason) => self.login_status = format!("⛔ ВЫ ЗАБАНЕНЫ: {}", reason),
+                                AuthStatus::DatabaseError(e) => self.login_status = format!("🔥 Ошибка БД: {}", e),
                             }
                         }
-                    }
+
+                        if !self.login_status.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new(&self.login_status).color(egui::Color32::RED));
+                        }
+                    });
                 });
-                
-                if let Some(s) = captured {
-                    match action {
-                        BindAction::Main => self.config.key_main = s,
-                        BindAction::Punish => self.config.key_punish = s,
-                        BindAction::Event => self.config.key_event = s,
-                        BindAction::Mp => self.config.key_mp = s,
-                        BindAction::Reload => self.config.key_reload = s,
-                    }
-                    self.waiting_for_key = None;
-                    self.update_hotkeys();
-                    save_config(&self.config);
-                }
             }
+            AppState::Main => {
+                // === ЗДЕСЬ ТВОЙ СТАРЫЙ ИНТЕРФЕЙС ===
+                ctx.request_repaint_after(Duration::from_millis(100));
+                self.check_daily_reset();
 
-            match self.current_tab {
-                MainTab::Setup => {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(30.0);
-                            ui.heading(egui::RichText::new("⚙ Настройки").size(24.0).strong().color(accent_color));
-                            if !self.is_admin {
-                                ui.label(egui::RichText::new("⚠ ПРАВА АДМИНИСТРАТОРА НЕ ОБНАРУЖЕНЫ ⚠").size(18.0).color(accent_color).strong());
-                                ui.label("Горячие клавиши в игре работать НЕ БУДУТ.");
-                            } else {
-                                ui.label(egui::RichText::new("✔ Запущено с правами администратора").color(egui::Color32::GREEN));
-                            }
-                            ui.add_space(20.0);
-                        });
+                while let Ok(action) = self.action_receiver.try_recv() {
+                    log(&format!("[UI] Switching tab to: {:?}", action));
+                    match action {
+                        HotkeyAction::MainMenu => self.current_tab = MainTab::InfoF6,
+                        HotkeyAction::PunishMenu => self.current_tab = MainTab::PunishF7,
+                        HotkeyAction::EventsMenu => self.current_tab = MainTab::TeleportF8,
+                        HotkeyAction::MpMenu => self.current_tab = MainTab::MpF9,
+                        HotkeyAction::Reload => restart_app(),
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
 
-                        // Блок выбора темы
-                        ui.group(|ui| {
-                            ui.heading("🎨 Внешний вид");
-                            ui.horizontal(|ui| {
-                                ui.label("Тема оформления:");
-                                egui::ComboBox::from_id_source("theme_selector")
-                                    .selected_text(match self.config.theme_mode {
-                                        0 => "🔵 Стандартная (Синяя)",
-                                        1 => "☀ Светлая",
-                                        2 => "🔷 Темно-синяя",
-                                        3 => "🔴 Красная",
-                                        4 => "🟣 Фиолетовая",
-                                        5 => "🟠 Оранжевая",
-                                        6 => "🟢 Зеленая",
-                                        7 => "🌸 Розовая",
-                                        8 => "👑 Золотая",
-                                        _ => "Неизвестная"
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut self.config.theme_mode, 0, "🔵 Стандартная (Синяя)");
-                                        ui.selectable_value(&mut self.config.theme_mode, 1, "☀ Светлая");
-                                        ui.selectable_value(&mut self.config.theme_mode, 2, "🔷 Темно-синяя");
-                                        ui.selectable_value(&mut self.config.theme_mode, 3, "🔴 Красная");
-                                        ui.selectable_value(&mut self.config.theme_mode, 4, "🟣 Фиолетовая");
-                                        ui.selectable_value(&mut self.config.theme_mode, 5, "🟠 Оранжевая");
-                                        ui.selectable_value(&mut self.config.theme_mode, 6, "🟢 Зеленая");
-                                        ui.selectable_value(&mut self.config.theme_mode, 7, "🌸 Розовая");
-                                        ui.selectable_value(&mut self.config.theme_mode, 8, "👑 Золотая");
-                                    });
-                            });
-                        });
-
-                        ui.add_space(15.0);
-                        ui.group(|ui| {
-                            ui.heading("⌨ Горячие клавиши");
-                            ui.label(egui::RichText::new("⚠ ВАЖНО: Переключите раскладку клавиатуры на английскую перед назначением клавиш!").color(accent_color).strong());
-                            ui.label("Кликните на кнопку, затем зажмите комбинацию (например: Alt + R).");
-                            ui.add_space(5.0);
-                            egui::Grid::new("setup_keys").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
-                                let btn_size = [150.0, 25.0];
-                                ui.label("Основное меню:");
-                                let txt1 = if self.waiting_for_key == Some(BindAction::Main) { "Нажмите клавиши...".to_string() } else { self.config.key_main.replace("NONE+", "") };
-                                if ui.add_sized(btn_size, egui::Button::new(txt1)).clicked() { self.waiting_for_key = Some(BindAction::Main); }
-                                ui.end_row();
-                                ui.label("Меню наказаний:");
-                                let txt2 = if self.waiting_for_key == Some(BindAction::Punish) { "Нажмите клавиши...".to_string() } else { self.config.key_punish.replace("NONE+", "") };
-                                if ui.add_sized(btn_size, egui::Button::new(txt2)).clicked() { self.waiting_for_key = Some(BindAction::Punish); }
-                                ui.end_row();
-                                ui.label("Меню событий:");
-                                let txt3 = if self.waiting_for_key == Some(BindAction::Event) { "Нажмите клавиши...".to_string() } else { self.config.key_event.replace("NONE+", "") };
-                                if ui.add_sized(btn_size, egui::Button::new(txt3)).clicked() { self.waiting_for_key = Some(BindAction::Event); }
-                                ui.end_row();
-                                ui.label("Меню МП:");
-                                let txt4 = if self.waiting_for_key == Some(BindAction::Mp) { "Нажмите клавиши...".to_string() } else { self.config.key_mp.replace("NONE+", "") };
-                                if ui.add_sized(btn_size, egui::Button::new(txt4)).clicked() { self.waiting_for_key = Some(BindAction::Mp); }
-                                ui.end_row();
-                                ui.label("Перезагрузка скрипта:");
-                                let txt5 = if self.waiting_for_key == Some(BindAction::Reload) { "Нажмите клавиши...".to_string() } else { self.config.key_reload.replace("NONE+", "") };
-                                if ui.add_sized(btn_size, egui::Button::new(txt5)).clicked() { self.waiting_for_key = Some(BindAction::Reload); }
-                                ui.end_row();
-                            });
-                        });
-                        ui.add_space(30.0);
-                        ui.vertical_centered(|ui| {
-                            
-                            if ui.add_sized([200.0, 40.0], egui::Button::new(egui::RichText::new("⚠ Сбросить все настройки").color(accent_color))).clicked() {
-                                self.reset_to_defaults();
-                            }
-                        });
-                    });
-                },
-                MainTab::Logs => {
-                     ui.heading("Диагностика и Логи");
-                     egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                         if let Ok(logs) = get_logs().lock() {
-                             for log in logs.iter() { ui.monospace(log); }
-                         }
-                     });
-                },
-                MainTab::InfoF6 => {
+                egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.f6_tab, F6Tab::Description, "Описание");
-                        ui.selectable_value(&mut self.f6_tab, F6Tab::Commands, "Команды");
-                        ui.selectable_value(&mut self.f6_tab, F6Tab::AutoReplace, "Автозамены");
-                        ui.selectable_value(&mut self.f6_tab, F6Tab::Events, "Мероприятия");
-                        ui.selectable_value(&mut self.f6_tab, F6Tab::OrgManager, "Организация");
-                        ui.selectable_value(&mut self.f6_tab, F6Tab::OnlineTimer, "Активность");
-                        ui.selectable_value(&mut self.f6_tab, F6Tab::BugReport, "Баг-репорт");
+                        ui.label(egui::RichText::new("🛡 AdminHelper").strong().color(accent_color).size(16.0));
+                        ui.separator();
+                        ui.selectable_value(&mut self.current_tab, MainTab::InfoF6, "Меню");
+                        ui.selectable_value(&mut self.current_tab, MainTab::PunishF7, "Наказания");
+                        ui.selectable_value(&mut self.current_tab, MainTab::TeleportF8, "События");
+                        ui.selectable_value(&mut self.current_tab, MainTab::MpF9, "Мероприятие");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("⚙ Настройки").clicked() { self.current_tab = MainTab::Setup; }
+                        });
+                        ui.selectable_value(&mut self.current_tab, MainTab::Logs, "🐞 Логи");
                     });
-                    ui.separator();
-                    match self.f6_tab {
-                        F6Tab::Description => {
-                            ui.heading("AdminHelper - Руководство"); ui.add_space(10.0);
-                            egui::ScrollArea::vertical().id_source("desc_scroll").show(ui, |ui| {
-                                ui.label(egui::RichText::new(format!("{} - Основное меню", self.config.key_main.replace("NONE+", ""))).strong().color(accent_color));
-                                ui.label("• Команды: Поиск и быстрая отправка команд в чат.");
-                                ui.label("• Автозамены: Готовые фразы (настройте триггеры).");
-                                ui.label("• Мероприятие: Памятка по проведению мероприятия.");
-                                ui.label("• Организация: Быстрая выдача рангов игрокам.");
-                                ui.label("• Онлайн: Счетчик времени администрирования.");
-                                ui.add_space(10.0);
-                                ui.label(egui::RichText::new(format!("{} - Система наказаний", self.config.key_punish.replace("NONE+", ""))).strong().color(accent_color));
-                                ui.label("• Слева: Список всех правил сервера.");
-                                ui.label("• Справа: Авто-генерация команды (/ban, /warn) с учетом времени и номера ЖБ.");
-                                ui.add_space(10.0);
-                                ui.label(egui::RichText::new(format!("{} - Телепорты", self.config.key_event.replace("NONE+", ""))).strong().color(accent_color));
-                                ui.label("• Быстрые телепорты по важным точкам (МП, Зоны).");
-                                ui.add_space(10.0);
-                                ui.label(egui::RichText::new(format!("{} - Менеджер мероприятий", self.config.key_mp.replace("NONE+", ""))).strong().color(accent_color));
-                                ui.label("• Сеты команд для автоматического проведения ивентов.");
-                                ui.label("• Телепорты в интерьеры для МП.");
-                                ui.add_space(10.0);
-                            });
-                        },
-                        F6Tab::Commands => {
-                            ui.horizontal(|ui| { ui.label("Поиск:"); ui.text_edit_singleline(&mut self.cmd_search); });
-                            
-                            egui::ScrollArea::vertical().id_source("f6_cmd_scroll").show(ui, |ui| {
-                                for (cmd, desc) in data::get_admin_commands() {
-                                    // Фильтр поиска
-                                    if self.cmd_search.is_empty() || cmd.to_lowercase().contains(&self.cmd_search.to_lowercase()) {
-                                        
-                                        // === НОВАЯ ЛОГИКА ===
-                                        // Проверяем описание: если есть '[', значит нужны аргументы.
-                                        let needs_args = desc.contains('[');
-                                        
-                                        // Если нужны аргументы -> Enter НЕ жмем (false), иначе жмем (true)
-                                        let press_enter = !needs_args;
-                                        
-                                        // Если нужны аргументы -> добавляем пробел в конце, чтобы сразу писать ID
-                                        let text_to_type = if needs_args { format!("{} ", cmd) } else { cmd.to_string() };
+                });
 
-                                        // === СТАРЫЙ СТИЛЬ ===
-                                        // Обычная кнопка с форматом "Команда - Описание"
-                                        if ui.button(format!("{} - {}", cmd, desc)).clicked() { 
-                                            type_in_game(Some(ctx.clone()), text_to_type, true, press_enter, None); 
-                                        }
+
+                egui::TopBottomPanel::bottom("bottom_bar").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        
+                        ui.label(format!("v{}", self.version));
+                        
+                        
+                        let url_opt = self.update_url.lock().ok().and_then(|o| o.clone());
+                        
+                        if let Some(url) = url_opt {
+                            ui.separator();
+                            ui.label(egui::RichText::new("🔥 Доступно обновление!").color(accent_color).strong());
+                            
+                            
+                            if ui.button("Скачать").clicked() {
+                                let _ = open::that(url);
+                            }
+                        }
+                    });
+                });
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(action) = self.waiting_for_key {
+                        let mut captured = None;
+                        ctx.input(|i| {
+                            for event in &i.events {
+                                if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
+                                    let bind_str = input_to_bind_string(*key, *modifiers);
+                                    if bind_str != "UNKNOWN" { 
+                                        captured = Some(bind_str); 
+                                        break; 
                                     }
                                 }
-                            });
-                        },
-                        F6Tab::AutoReplace => {
-                            
-                            ui.horizontal(|ui| {
-                                ui.label("🔎 Поиск:");
-                               
-                                let available_width = ui.available_width() - 140.0; 
-                                ui.add(egui::TextEdit::singleline(&mut self.replace_search).desired_width(available_width));
-                                
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("💾 Сохранить всё").clicked() { self.save_triggers(); }
+                            }
+                        });
+                        
+                        if let Some(s) = captured {
+                            match action {
+                                BindAction::Main => self.config.key_main = s,
+                                BindAction::Punish => self.config.key_punish = s,
+                                BindAction::Event => self.config.key_event = s,
+                                BindAction::Mp => self.config.key_mp = s,
+                                BindAction::Reload => self.config.key_reload = s,
+                            }
+                            self.waiting_for_key = None;
+                            self.update_hotkeys();
+                            save_config(&self.config);
+                        }
+                    }
+
+                    match self.current_tab {
+                        MainTab::Setup => {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(30.0);
+                                    ui.heading(egui::RichText::new("⚙ Настройки").size(24.0).strong().color(accent_color));
+                                    if !self.is_admin {
+                                        ui.label(egui::RichText::new("⚠ ПРАВА АДМИНИСТРАТОРА НЕ ОБНАРУЖЕНЫ ⚠").size(18.0).color(accent_color).strong());
+                                        ui.label("Горячие клавиши в игре работать НЕ БУДУТ.");
+                                    } else {
+                                        ui.label(egui::RichText::new("✔ Запущено с правами администратора").color(accent_color).strong());
+                                    }
+                                    ui.add_space(20.0);
+                                });
+
+                                // Блок выбора темы
+                                ui.group(|ui| {
+                                    ui.heading("🎨 Внешний вид");
+                                    ui.horizontal(|ui| {
+                                        ui.label("Тема оформления:");
+                                        egui::ComboBox::from_id_source("theme_selector")
+                                            .selected_text(match self.config.theme_mode {
+                                                0 => "🔵 Стандартная (Синяя)",
+                                                1 => "☀ Светлая",
+                                                2 => "🔷 Темно-синяя",
+                                                3 => "🔴 Красная",
+                                                4 => "🟣 Фиолетовая",
+                                                5 => "🟠 Оранжевая",
+                                                6 => "🟢 Зеленая",
+                                                7 => "🌸 Розовая",
+                                                8 => "👑 Золотая",
+                                                _ => "Неизвестная"
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut self.config.theme_mode, 0, "🔵 Стандартная (Синяя)");
+                                                ui.selectable_value(&mut self.config.theme_mode, 1, "☀ Светлая");
+                                                ui.selectable_value(&mut self.config.theme_mode, 2, "🔷 Темно-синяя");
+                                                ui.selectable_value(&mut self.config.theme_mode, 3, "🔴 Красная");
+                                                ui.selectable_value(&mut self.config.theme_mode, 4, "🟣 Фиолетовая");
+                                                ui.selectable_value(&mut self.config.theme_mode, 5, "🟠 Оранжевая");
+                                                ui.selectable_value(&mut self.config.theme_mode, 6, "🟢 Зеленая");
+                                                ui.selectable_value(&mut self.config.theme_mode, 7, "🌸 Розовая");
+                                                ui.selectable_value(&mut self.config.theme_mode, 8, "👑 Золотая");
+                                            });
+                                    });
+                                });
+
+                                ui.add_space(15.0);
+                                ui.group(|ui| {
+                                    ui.heading("⌨ Горячие клавиши");
+                                    ui.label(egui::RichText::new("⚠ ВАЖНО: Переключите раскладку клавиатуры на английскую перед назначением клавиш!").color(accent_color).strong());
+                                    ui.label("Кликните на кнопку, затем зажмите комбинацию (например: Alt + R).");
+                                    ui.add_space(5.0);
+                                    egui::Grid::new("setup_keys").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
+                                        let btn_size = [150.0, 25.0];
+                                        ui.label("Основное меню:");
+                                        let txt1 = if self.waiting_for_key == Some(BindAction::Main) { "Нажмите клавиши...".to_string() } else { self.config.key_main.replace("NONE+", "") };
+                                        if ui.add_sized(btn_size, egui::Button::new(txt1)).clicked() { self.waiting_for_key = Some(BindAction::Main); }
+                                        ui.end_row();
+                                        ui.label("Меню наказаний:");
+                                        let txt2 = if self.waiting_for_key == Some(BindAction::Punish) { "Нажмите клавиши...".to_string() } else { self.config.key_punish.replace("NONE+", "") };
+                                        if ui.add_sized(btn_size, egui::Button::new(txt2)).clicked() { self.waiting_for_key = Some(BindAction::Punish); }
+                                        ui.end_row();
+                                        ui.label("Меню событий:");
+                                        let txt3 = if self.waiting_for_key == Some(BindAction::Event) { "Нажмите клавиши...".to_string() } else { self.config.key_event.replace("NONE+", "") };
+                                        if ui.add_sized(btn_size, egui::Button::new(txt3)).clicked() { self.waiting_for_key = Some(BindAction::Event); }
+                                        ui.end_row();
+                                        ui.label("Меню МП:");
+                                        let txt4 = if self.waiting_for_key == Some(BindAction::Mp) { "Нажмите клавиши...".to_string() } else { self.config.key_mp.replace("NONE+", "") };
+                                        if ui.add_sized(btn_size, egui::Button::new(txt4)).clicked() { self.waiting_for_key = Some(BindAction::Mp); }
+                                        ui.end_row();
+                                        ui.label("Перезагрузка скрипта:");
+                                        let txt5 = if self.waiting_for_key == Some(BindAction::Reload) { "Нажмите клавиши...".to_string() } else { self.config.key_reload.replace("NONE+", "") };
+                                        if ui.add_sized(btn_size, egui::Button::new(txt5)).clicked() { self.waiting_for_key = Some(BindAction::Reload); }
+                                        ui.end_row();
+                                    });
+                                });
+                                ui.add_space(30.0);
+                                ui.vertical_centered(|ui| {
+                                    
+                                    if ui.add_sized([200.0, 40.0], egui::Button::new(egui::RichText::new("⚠ Сбросить все настройки").color(accent_color))).clicked() {
+                                        self.reset_to_defaults();
+                                    }
                                 });
                             });
-                            
+                        },
+                        MainTab::Logs => {
+                             ui.heading("Диагностика и Логи");
+                             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                                 if let Ok(logs) = get_logs().lock() {
+                                     for log in logs.iter() { ui.monospace(log); }
+                                 }
+                             });
+                        },
+                        MainTab::InfoF6 => {
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut self.f6_tab, F6Tab::Description, "Описание");
+                                ui.selectable_value(&mut self.f6_tab, F6Tab::Commands, "Команды");
+                                ui.selectable_value(&mut self.f6_tab, F6Tab::AutoReplace, "Автозамены");
+                                ui.selectable_value(&mut self.f6_tab, F6Tab::Events, "Мероприятия");
+                                ui.selectable_value(&mut self.f6_tab, F6Tab::OrgManager, "Организация");
+                                ui.selectable_value(&mut self.f6_tab, F6Tab::OnlineTimer, "Активность");
+                                ui.selectable_value(&mut self.f6_tab, F6Tab::BugReport, "Баг-репорт");
+                            });
                             ui.separator();
-                            ui.add_space(5.0);
-
-                            
-                            ui.columns(2, |columns| {
-                                
-                                columns[0].vertical(|ui| {
-                                    ui.heading(egui::RichText::new("👤 Мои автозамены").color(accent_color));
-                                    ui.add_space(5.0);
+                            match self.f6_tab {
+                                F6Tab::Description => {
+                                    ui.heading("AdminHelper - Руководство"); ui.add_space(10.0);
+                                    egui::ScrollArea::vertical().id_source("desc_scroll").show(ui, |ui| {
+                                        ui.label(egui::RichText::new(format!("{} - Основное меню", self.config.key_main.replace("NONE+", ""))).strong().color(accent_color));
+                                        ui.label("• Команды: Поиск и быстрая отправка команд в чат.");
+                                        ui.label("• Автозамены: Готовые фразы (настройте триггеры).");
+                                        ui.label("• Мероприятие: Памятка по проведению мероприятия.");
+                                        ui.label("• Организация: Быстрая выдача рангов игрокам.");
+                                        ui.label("• Онлайн: Счетчик времени администрирования.");
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new(format!("{} - Система наказаний", self.config.key_punish.replace("NONE+", ""))).strong().color(accent_color));
+                                        ui.label("• Слева: Список всех правил сервера.");
+                                        ui.label("• Справа: Авто-генерация команды (/ban, /warn) с учетом времени и номера ЖБ.");
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new(format!("{} - Телепорты", self.config.key_event.replace("NONE+", ""))).strong().color(accent_color));
+                                        ui.label("• Быстрые телепорты по важным точкам (МП, Зоны).");
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new(format!("{} - Менеджер мероприятий", self.config.key_mp.replace("NONE+", ""))).strong().color(accent_color));
+                                        ui.label("• Сеты команд для автоматического проведения ивентов.");
+                                        ui.label("• Телепорты в интерьеры для МП.");
+                                        ui.add_space(10.0);
+                                    });
+                                },
+                                F6Tab::Commands => {
+                                    ui.horizontal(|ui| { ui.label("Поиск:"); ui.text_edit_singleline(&mut self.cmd_search); });
                                     
+                                    egui::ScrollArea::vertical().id_source("f6_cmd_scroll").show(ui, |ui| {
+                                        for (cmd, desc) in data::get_admin_commands() {
+                                            // Фильтр поиска
+                                            if self.cmd_search.is_empty() || cmd.to_lowercase().contains(&self.cmd_search.to_lowercase()) {
+                                                
+                                                // === НОВАЯ ЛОГИКА ===
+                                                // Проверяем описание: если есть '[', значит нужны аргументы.
+                                                let needs_args = desc.contains('[');
+                                                
+                                                // Если нужны аргументы -> Enter НЕ жмем (false), иначе жмем (true)
+                                                let press_enter = !needs_args;
+                                                
+                                                // Если нужны аргументы -> добавляем пробел в конце, чтобы сразу писать ID
+                                                let text_to_type = if needs_args { format!("{} ", cmd) } else { cmd.to_string() };
+
+                                                // === СТАРЫЙ СТИЛЬ ===
+                                                // Обычная кнопка с форматом "Команда - Описание"
+                                                if ui.button(format!("{} - {}", cmd, desc)).clicked() { 
+                                                    type_in_game(Some(ctx.clone()), text_to_type, true, press_enter, None); 
+                                                }
+                                            }
+                                        }
+                                    });
+                                },
+                                F6Tab::AutoReplace => {
+                                    
+                                    ui.horizontal(|ui| {
+                                        ui.label("🔎 Поиск:");
+                                        
+                                        let available_width = ui.available_width() - 140.0; 
+                                        ui.add(egui::TextEdit::singleline(&mut self.replace_search).desired_width(available_width));
+                                        
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.button("💾 Сохранить всё").clicked() { self.save_triggers(); }
+                                        });
+                                    });
+                                    
+                                    ui.separator();
+                                    ui.add_space(5.0);
+
+                                    
+                                    ui.columns(2, |columns| {
+                                        
+                                        columns[0].vertical(|ui| {
+                                            ui.heading(egui::RichText::new("👤 Мои автозамены").color(accent_color));
+                                            ui.add_space(5.0);
+                                            
+                                            
+                                            ui.group(|ui| {
+                                                ui.label(egui::RichText::new("➕ Создать новую").strong());
+                                                
+                                                
+                                                egui::Grid::new("new_rep_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                                                    ui.label("Бинд:");
+                                                    ui.add(egui::TextEdit::singleline(&mut self.new_rep_trigger).desired_width(f32::INFINITY).hint_text("п1"));
+                                                    ui.end_row();
+
+                                                    ui.label("Описание:");
+                                                    ui.add(egui::TextEdit::singleline(&mut self.new_rep_label).desired_width(f32::INFINITY).hint_text("Коротко об бинде"));
+                                                    ui.end_row();
+
+                                                    ui.label("Текст:");
+                                                    ui.add(egui::TextEdit::multiline(&mut self.new_rep_text).desired_width(f32::INFINITY).desired_rows(3));
+                                                    ui.end_row();
+                                                });
+
+                                                ui.add_space(5.0);
+                                                ui.vertical_centered_justified(|ui| {
+                                                    if ui.button("Добавить").clicked() {
+                                                        if !self.new_rep_trigger.is_empty() && !self.new_rep_text.is_empty() {
+                                                            if let Ok(mut replacements) = self.active_replacements.lock() {
+                                                                replacements.push(ActiveReplacement {
+                                                                    trigger: self.new_rep_trigger.clone(),
+                                                                    label: self.new_rep_label.clone(),
+                                                                    text: self.new_rep_text.clone(),
+                                                                    is_system: false,
+                                                                });
+                                                                self.new_rep_trigger.clear(); self.new_rep_label.clear(); self.new_rep_text.clear();
+                                                            }
+                                                            self.save_triggers();
+                                                        }
+                                                    }
+                                                });
+                                            });
+
+                                            ui.add_space(10.0);
+                                            ui.separator();
+                                            
+                                            
+                                            egui::ScrollArea::vertical().id_source("custom_rep_scroll").max_height(ui.available_height() - 20.0).show(ui, |ui| {
+                                                if let Ok(mut replacements) = self.active_replacements.lock() {
+                                                    
+                                                    let mut to_remove = None;
+                                                    
+                                                    for (idx, rep) in replacements.iter_mut().enumerate() {
+                                                        if rep.is_system { continue; }
+                                                        if !self.replace_search.is_empty() && !rep.label.to_lowercase().contains(&self.replace_search.to_lowercase()) { continue; }
+                                                        
+                                                        ui.group(|ui| {
+                                                            ui.set_width(ui.available_width()); 
+                                                            
+                                                            
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(egui::RichText::new(&rep.label).strong().color(accent_color));
+                                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                    if ui.button("🗑").clicked() { to_remove = Some(idx); }
+                                                                });
+                                                            });
+                                                            
+                                                            
+                                                            ui.horizontal(|ui| { 
+                                                                ui.label("Бинд:"); 
+                                                                ui.add(egui::TextEdit::singleline(&mut rep.trigger).desired_width(50.0)); 
+                                                            });
+                                                            
+                                                            
+                                                            let oneline = rep.text.replace("\n", " ");
+                                                            let preview = if oneline.chars().count() > 50 { 
+                                                                format!("{}...", oneline.chars().take(50).collect::<String>()) 
+                                                            } else { 
+                                                                oneline 
+                                                            };
+                                                            
+                                                            let resp = ui.label(egui::RichText::new(preview).weak().size(11.0));
+                                                            if resp.hovered() { egui::show_tooltip_text(ui.ctx(), ui.id(), &rep.text); }
+                                                        });
+                                                    }
+
+                                                    
+                                                    if let Some(idx) = to_remove {
+                                                        replacements.remove(idx);
+                                                    }
+                                                }
+                                            });
+                                        });
+
+                                        
+                                        columns[1].vertical(|ui| {
+                                            ui.heading(egui::RichText::new("🔧 Стандартные").color(accent_color));
+                                            ui.separator();
+                                            
+                                            egui::ScrollArea::vertical().id_source("system_rep_scroll").show(ui, |ui| {
+                                                
+                                                let total_width = ui.available_width();
+                                                
+                                                let width_bind = 50.0;
+                                                let width_desc = 180.0;
+                                                let width_text = (total_width - width_bind - width_desc - 30.0).max(100.0);
+
+                                                egui::Grid::new("sys_grid")
+                                                    .striped(true)
+                                                    .spacing([10.0, 10.0])
+                                                    .min_col_width(50.0)
+                                                    .show(ui, |ui| {
+                                                        // Заголовки таблицы
+                                                        ui.label(egui::RichText::new("Бинд").strong()); 
+                                                        ui.label(egui::RichText::new("Описание").strong()); 
+                                                        ui.label(egui::RichText::new("Текст").strong()); 
+                                                        ui.end_row();
+                                                        
+                                                        if let Ok(mut replacements) = self.active_replacements.lock() {
+                                                            for rep in replacements.iter_mut() {
+                                                                if !rep.is_system { continue; }
+                                                                
+                                                                if !self.replace_search.is_empty() && !rep.label.to_lowercase().contains(&self.replace_search.to_lowercase()) {
+                                                                    continue;
+                                                                }
+
+                                                                
+                                                                ui.add(egui::TextEdit::singleline(&mut rep.trigger).desired_width(width_bind).hint_text("..."));
+                                                                
+                                                                
+                                                                ui.add_sized([width_desc, 20.0], egui::Label::new(&rep.label).truncate(true));
+                                                                
+                                                                
+                                                                let oneline = rep.text.replace("\n", " ");
+                                                                
+                                                                let resp = ui.add_sized(
+                                                                    [width_text, 20.0], 
+                                                                    egui::Label::new(oneline).truncate(true)
+                                                                );
+                                                                
+                                                                if resp.hovered() { 
+                                                                    egui::show_tooltip_text(ui.ctx(), ui.id(), &rep.text); 
+                                                                }
+                                                                
+                                                                ui.end_row();
+                                                            }
+                                                        }
+                                                    });
+                                            });
+                                        });
+                                    });
+                                },
+                                F6Tab::Events => {
+                                    egui::ScrollArea::vertical().id_source("f6_events_scroll").show(ui, |ui| {
+                                        ui.heading("📋 Порядок проведения мероприятия");
+                                        ui.separator();
+                                        ui.collapsing("1. Подготовка и Сбор", |ui| {
+                                            ui.label("1. Выберите место проведения (см. F9 Телепорты).");
+                                            ui.label("2. Переместитесь в дименшин и уведомить других администраторов (/dim 824151 3).");
+                                            ui.label("3. Спросите у других кто хочет участвовать на меропрятие.");
+                                            ui.label("4. Подготовьте все необходимое для проведения мероприятия.");
+                                        });
+                                        ui.collapsing("2. Начало мероприятия", |ui| {
+                                            ui.label("Откройте телепорт выставите кол-во игроков время проведение и название мероприятие (/gomp 30 30 Прятки)");
+                                            ui.label("После того как соберутся игроки нужно их выстрить и объяснить суть мероприятия.");
+                                            ui.label("Также объяснить что запрещено делать.");
+                                        });
+                                        ui.collapsing("3. Выдача экипировки", |ui| {
+                                            ui.label("1. Выдать все необходимые предметы для игроков.");
+                                            ui.label("2. Выдайте ХП и броню для игроков.");
+                                            ui.label("3. Начать мероприятие написав в чат мероприятие 'Начали!'.");
+                                        });
+                                        ui.collapsing("4. Финал и Приз", |ui| {
+                                            ui.label("1. Проследите за мероприятием и его нарушениеми");
+                                            ui.label("2. Закрыть димешшин.");
+                                            ui.label("3. После определние победителя - объявите его.");
+                                            ui.label("4. Отправить отчёт об проведённом мероприятии.");
+                                        });
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new("Примечание: Не забудьте что начало и конец мероприятие нужно скринить а также используйте F9 для автоматизации команд.").italics().color(accent_color));
+                                    });
+                                },
+                                F6Tab::OrgManager => {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space(10.0);
+                                        ui.heading(egui::RichText::new("👔 Управление Фракцией").size(20.0).strong().color(accent_color));
+                                    });
+                                    
+                                    ui.add_space(10.0);
                                     
                                     ui.group(|ui| {
-                                        ui.label(egui::RichText::new("➕ Создать новую").strong());
+                                        egui::Grid::new("org_grid")
+                                            .num_columns(2)
+                                            .spacing([15.0, 15.0])
+                                            .striped(true)
+                                            .show(ui, |ui| {
+                                                
+                                                ui.label(egui::RichText::new("👤 ID Игрока:").strong().color(accent_color));
+                                                ui.add(egui::TextEdit::singleline(&mut self.org_input_id)
+                                                    .desired_width(120.0)
+                                                    .hint_text("12156"));
+                                                ui.end_row();
+
+                                                ui.label(egui::RichText::new("🏰 Организация:").strong().color(accent_color));
+                                                let current_org_name = self.orgs[self.selected_org_index].name.clone();
+                                                egui::ComboBox::from_id_source("org_selector")
+                                                    .selected_text(current_org_name)
+                                                    .width(220.0)
+                                                    .show_ui(ui, |ui| {
+                                                        for (i, org) in self.orgs.iter().enumerate() { 
+                                                            if ui.selectable_value(&mut self.selected_org_index, i, &org.name).changed() { 
+                                                                self.selected_rank_index = 0; 
+                                                            } 
+                                                        }
+                                                    });
+                                                ui.end_row();
+
+                                                ui.label(egui::RichText::new("⭐ Ранг:").strong().color(accent_color));
+                                                let current_org = &self.orgs[self.selected_org_index];
+                                                if !current_org.ranks.is_empty() {
+                                                    let current_rank_name = current_org.ranks[self.selected_rank_index].name.clone();
+                                                    egui::ComboBox::from_id_source("rank_selector")
+                                                        .selected_text(current_rank_name)
+                                                        .width(220.0)
+                                                        .show_ui(ui, |ui| {
+                                                            for (i, rank) in current_org.ranks.iter().enumerate() { 
+                                                                ui.selectable_value(&mut self.selected_rank_index, i, &rank.name); 
+                                                            }
+                                                        });
+                                                } else { 
+                                                    ui.label(egui::RichText::new("Нет рангов").italics()); 
+                                                }
+                                                ui.end_row();
+                                            });
+                                    });
+
+                                    ui.add_space(15.0);
+                                    
+                                    ui.vertical_centered(|ui| {
+                                        let btn_text_color = if self.config.theme_mode == 1 { 
+                                            egui::Color32::BLACK 
+                                        } else { 
+                                            egui::Color32::WHITE 
+                                        };
+
+                                        if ui.add_sized(
+                                            [180.0, 35.0], 
+                                            egui::Button::new(egui::RichText::new("ВЫДАТЬ РАНГ").strong().color(btn_text_color))
+                                        ).clicked() {
+                                            let org = &self.orgs[self.selected_org_index];
+                                            if !org.ranks.is_empty() {
+                                                let rank = &org.ranks[self.selected_rank_index];
+                                                let cmd = format!("/setfactionrank {} {} {}", self.org_input_id, org.key, rank.id);
+                                                type_in_game(Some(ctx.clone()), cmd, true, true, None);
+                                            }
+                                        }
+                                    });
+                                },
+                                F6Tab::OnlineTimer => {
+                                    let s = self.get_total_seconds();
+                                    let hours = s / 3600;
+                                    let mins = (s % 3600) / 60;
+                                    let secs = s % 60;
+                                    let time_str = format!("{:02}:{:02}:{:02}", hours, mins, secs);
+
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space(15.0);
                                         
                                         
-                                        egui::Grid::new("new_rep_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                                            ui.label("Бинд:");
-                                            ui.add(egui::TextEdit::singleline(&mut self.new_rep_trigger).desired_width(f32::INFINITY).hint_text("п1"));
-                                            ui.end_row();
-
-                                            ui.label("Описание:");
-                                            ui.add(egui::TextEdit::singleline(&mut self.new_rep_label).desired_width(f32::INFINITY).hint_text("Коротко об бинде"));
-                                            ui.end_row();
-
-                                            ui.label("Текст:");
-                                            ui.add(egui::TextEdit::multiline(&mut self.new_rep_text).desired_width(f32::INFINITY).desired_rows(3));
-                                            ui.end_row();
-                                        });
+                                        if self.timer_paused {
+                                            ui.label(egui::RichText::new("💤 Таймер на паузе").color(egui::Color32::from_rgb(255, 200, 0))); // Желтый
+                                        } else {
+                                            ui.label(egui::RichText::new("🔥 Таймер активен").color(accent_color)); // Цвет темы
+                                        }
 
                                         ui.add_space(5.0);
-                                        ui.vertical_centered_justified(|ui| {
-                                            if ui.button("Добавить").clicked() {
-                                                if !self.new_rep_trigger.is_empty() && !self.new_rep_text.is_empty() {
-                                                    if let Ok(mut replacements) = self.active_replacements.lock() {
-                                                        replacements.push(ActiveReplacement {
-                                                            trigger: self.new_rep_trigger.clone(),
-                                                            label: self.new_rep_label.clone(),
-                                                            text: self.new_rep_text.clone(),
-                                                            is_system: false,
-                                                        });
-                                                        self.new_rep_trigger.clear(); self.new_rep_label.clear(); self.new_rep_text.clear();
-                                                    }
-                                                    self.save_triggers();
+
+                                        
+                                        ui.label(egui::RichText::new(time_str)
+                                            .size(45.0) 
+                                            .strong()
+                                            .monospace()
+                                            .color(accent_color));
+
+                                        ui.add_space(20.0);
+
+                                        ui.horizontal(|ui| {
+                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center), |ui| {
+                                                
+                                                
+                                                let (btn_text, btn_icon) = if self.timer_paused { ("Продолжить", "▶") } else { ("Пауза", "⏸") };
+                                                
+                                                if ui.add_sized([130.0, 35.0], egui::Button::new(
+                                                    format!("{} {}", btn_icon, btn_text)
+                                                )).clicked() { 
+                                                    self.timer_paused = !self.timer_paused; 
+                                                    if self.timer_paused { 
+                                                        self.timer_saved_seconds += self.timer_start.elapsed().as_secs(); 
+                                                    } else { 
+                                                        self.timer_start = Instant::now(); 
+                                                    } 
                                                 }
+
+                                                ui.add_space(10.0);
+
+                                                if ui.add_sized([130.0, 35.0], egui::Button::new("🔄 Сбросить")).clicked() { 
+                                                    self.reset_timer(); 
+                                                }
+                                            });
+                                        });
+                                        
+                                        ui.add_space(15.0);
+                                        ui.separator();
+                                        ui.label(egui::RichText::new("Автоматический сброс в 03:00 утра.").weak().size(12.0));
+                                    });
+                                },
+                                F6Tab::BugReport => {
+                                    egui::ScrollArea::vertical().id_source("bug_report_scroll").show(ui, |ui| {
+                                        ui.heading("🐞 Регламент работы с багами");
+                                        ui.separator();
+                                        ui.label(egui::RichText::new("При фиксации бага администратор должен запросить у игрока:").strong().color(accent_color));
+                                        ui.add_space(5.0);
+                                        ui.label("1. Дату возникновения бага.");
+                                        ui.label("2. Суть проблемы (текстовое описание).");
+                                        ui.label("3. Доказательства (предпочтительно видео, в отдельных случаях скриншот).");
+                                        ui.label("4. Логи (при серьёзных багах: бессмертие, бесконечные патроны, пропавшие текстуры, вылеты, ошибки).");
+
+                                        ui.add_space(15.0);
+                                        ui.heading("📂 Как выгрузить логи?");
+                                        ui.label("Файлы логов находятся в папке RAGEMP по следующему пути:");
+                                        ui.add_space(5.0);
+                                        ui.monospace("RAGEMP\\clientdata\\console.txt");
+                                        ui.monospace("RAGEMP\\clientdata\\cef_game_logs.txt");
+                                        ui.monospace("RAGEMP\\clientdata\\cef_launcher_log.txt");
+                                        ui.monospace("RAGEMP\\clientdata\\main_logs.txt");
+
+                                        ui.add_space(15.0);
+                                        ui.heading("📝 Порядок действий:");
+                                        ui.label("1. Выдели все файлы (Ctrl + ЛКМ) и нажми правую кнопку мыши.");
+                                        ui.label("2. Выбери «Добавить в архив» (WinRAR/7-Zip).");
+                                        ui.label("3. Открой Google Диск и нажми «Создать».");
+                                        ui.label("4. Выбери «Загрузить файлы» и дождись загрузки.");
+                                        ui.label("5. Настрой доступ к файлу (доступ по ссылке).");
+                                        ui.label("6. Отправь ссылку на архив с откатом в Discord, в канал #баг-репорт.");
+                                    });
+                                },
+                            }
+                        },
+                        MainTab::PunishF7 => {
+                            ui.columns(2, |columns| {
+                                columns[0].vertical(|ui| {
+                                    ui.horizontal(|ui| { ui.label("🔎"); ui.text_edit_singleline(&mut self.search_text); if !self.search_text.is_empty() && ui.button("X").clicked() { self.search_text.clear(); } }); ui.separator();
+                                    egui::ScrollArea::vertical().id_source("f7_list_scroll").show(ui, |ui| {
+                                        let query = self.search_text.to_lowercase();
+                                        let mut picked_rule: Option<Rule> = None;
+                                        for rule in &self.rules {
+                                            if query.is_empty() || rule.article.to_lowercase().contains(&query) || rule.title.to_lowercase().contains(&query) {
+                                                if ui.add_sized([ui.available_width(), 20.0], egui::Button::new(format!("{} - {}", rule.article, rule.title))).clicked() { picked_rule = Some(rule.clone()); }
+                                            }
+                                        }
+                                        if let Some(rule) = picked_rule { self.selected_rule = Some(rule); self.selected_punishment_idx = 0; self.update_punish_command(); }
+                                    });
+                                });
+                                columns[1].vertical(|ui| {
+                                    let current_rule = self.selected_rule.clone();
+                                    if let Some(rule) = current_rule {
+                                        ui.heading(format!("{} {}", rule.article, rule.title)); ui.separator();
+                                        egui::ScrollArea::vertical().id_source("f7_desc_scroll").max_height(300.0).show(ui, |ui| { let clean_desc = rule.description.replace("`n", "\n");ui.label(egui::RichText::new(clean_desc).italics()); }); ui.separator();
+                                        egui::Grid::new("punish_inputs").spacing([10.0, 10.0]).show(ui, |ui| {
+                                            ui.label("ID:"); if ui.add(egui::TextEdit::singleline(&mut self.input_id).desired_width(100.0)).changed() { self.update_punish_command(); } ui.end_row();
+                                            ui.label("Время:"); if ui.add(egui::TextEdit::singleline(&mut self.input_violation_time).desired_width(100.0)).changed() { self.update_punish_command(); } ui.end_row();
+                                            ui.label("ЖБ:"); if ui.add(egui::TextEdit::singleline(&mut self.input_report_num).desired_width(100.0)).changed() { self.update_punish_command(); } ui.end_row();
+                                        }); ui.separator();
+                                        let options = Self::get_rule_options(&rule);
+                                        for (i, opt) in options.iter().enumerate() { if ui.radio_value(&mut self.selected_punishment_idx, i, &opt.label).changed() { self.update_punish_command(); } } ui.separator();
+                                        ui.add_sized([ui.available_width(), 30.0], egui::TextEdit::multiline(&mut self.generated_punish_cmd));
+                                        ui.horizontal(|ui| {
+                                            if ui.button("📋 Копировать").clicked() { if let Ok(mut clipboard) = Clipboard::new() { let _ = clipboard.set_text(self.generated_punish_cmd.clone()); } }
+                                            if ui.button("🚀 Выдать (Enter)").clicked() { type_in_game(Some(ctx.clone()), self.generated_punish_cmd.clone(), true, true, None); }
+                                        });
+                                    } else { ui.label("Выберите правило слева"); }
+                                });
+                            });
+                        },
+                        MainTab::TeleportF8 => {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("📂 Категория:");
+                                    egui::ComboBox::from_id_source("tp_cat").selected_text(&self.teleport_category).width(180.0)
+                                        .show_ui(ui, |ui| {
+                                             ui.selectable_value(&mut self.teleport_category, "Все события".to_string(), "Все события");
+                                             ui.selectable_value(&mut self.teleport_category, "Налёты".to_string(), "Налёты");
+                                             ui.selectable_value(&mut self.teleport_category, "Захват Районов".to_string(), "Захват Районов");
+                                             ui.selectable_value(&mut self.teleport_category, "Захват территорий".to_string(), "Захват территорий");
+                                             ui.selectable_value(&mut self.teleport_category, "Поставки, ограбление".to_string(), "Поставки");
+                                             ui.selectable_value(&mut self.teleport_category, "ВЗК, ВЗА".to_string(), "ВЗК, ВЗА");
+                                        });
+                                    ui.add_space(15.0);
+                                    ui.label("🔍 Поиск:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.teleport_search).desired_width(120.0));
+                                });
+                            });
+                            ui.add_space(10.0); ui.separator(); ui.add_space(5.0);
+                            ui.scope(|ui| {
+                                let style = ui.style_mut();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(70));
+                                style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+                                style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+                                style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+
+                                egui::ScrollArea::vertical().id_source("f8_tp_scroll").show(ui, |ui| {
+                                        let spacing_x = 10.0;
+                                        let btn_width = (ui.available_width() - spacing_x - 8.0) / 2.0;
+                                        egui::Grid::new("tp_grid").num_columns(2).spacing([spacing_x, 10.0]).striped(true).show(ui, |ui| {
+                                                let query = self.teleport_search.to_lowercase();
+                                                let mut c = 0;
+                                                for tp in &self.teleport_list {
+                                                    if (self.teleport_category == "Все события" || tp.category == self.teleport_category)
+                                                        && (query.is_empty() || tp.name.to_lowercase().contains(&query))
+                                                    {
+                                                        let btn_text = egui::RichText::new(&tp.name).size(14.0);
+                                                        if ui.add_sized([btn_width, 28.0], egui::Button::new(btn_text)).clicked() { run_teleport(ctx, &tp.command); }
+                                                        c += 1;
+                                                        if c % 2 == 0 { ui.end_row(); }
+                                                    }
+                                                }
+                                        });
+                                });
+                            });
+                        },
+                        MainTab::MpF9 => {
+                            ui.heading("Менеджер мероприятий"); ui.separator();
+                            ui.horizontal(|ui| { ui.selectable_value(&mut self.f9_tab, F9Tab::Commands, "Команды"); ui.selectable_value(&mut self.f9_tab, F9Tab::Teleports, "Телепорты"); }); ui.separator();
+
+                            let is_running = self.is_mp_running.load(Ordering::Relaxed);
+                            if is_running {
+                                ui.colored_label(egui::Color32::RED, "⏳ Выполняется команда... Подождите");
+                            }
+                            ui.set_enabled(!is_running);
+
+                            match self.f9_tab {
+                                F9Tab::Commands => {
+                                    egui::ScrollArea::vertical().id_source("f9_cmd_scroll").show(ui, |ui| {
+                                        egui::Grid::new("mp_c").striped(true).spacing([10.0, 10.0]).show(ui, |ui| {
+                                            let presets = data::get_mp_commands(&self.config.admin_id);
+                                            for (i, p) in presets.iter().enumerate() {
+                                                if ui.add_sized([250.0, 30.0], egui::Button::new(&p.button_name)).clicked() {
+                                                    let cmds = p.commands.clone();
+                                                    self.is_mp_running.store(true, Ordering::Relaxed);
+                                                    let flag = self.is_mp_running.clone();
+
+                                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+
+                                                    thread::spawn(move || {
+                                                         thread::sleep(Duration::from_millis(500));
+                                                         log("MP Thread: Starting commands execution...");
+                                                         for cmd in cmds {
+                                                             type_in_game(None, cmd, true, true, None);
+                                                             thread::sleep(Duration::from_millis(1500));
+                                                         }
+                                                         flag.store(false, Ordering::Relaxed);
+                                                    });
+                                                }
+                                                if (i + 1) % 2 == 0 { ui.end_row(); }
                                             }
                                         });
                                     });
-
-                                    ui.add_space(10.0);
-                                    ui.separator();
-                                    
-                                    
-                                    egui::ScrollArea::vertical().id_source("custom_rep_scroll").max_height(ui.available_height() - 20.0).show(ui, |ui| {
-                                        if let Ok(mut replacements) = self.active_replacements.lock() {
-                                            
-                                            let mut to_remove = None;
-                                            
-                                            for (idx, rep) in replacements.iter_mut().enumerate() {
-                                                if rep.is_system { continue; }
-                                                if !self.replace_search.is_empty() && !rep.label.to_lowercase().contains(&self.replace_search.to_lowercase()) { continue; }
-                                                
-                                                ui.group(|ui| {
-                                                    ui.set_width(ui.available_width()); 
-                                                    
-                                                    
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(egui::RichText::new(&rep.label).strong().color(accent_color));
-                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                            if ui.button("🗑").clicked() { to_remove = Some(idx); }
-                                                        });
-                                                    });
-                                                    
-                                                    
-                                                    ui.horizontal(|ui| { 
-                                                        ui.label("Бинд:"); 
-                                                        ui.add(egui::TextEdit::singleline(&mut rep.trigger).desired_width(50.0)); 
-                                                    });
-                                                    
-                                                    
-                                                    let oneline = rep.text.replace("\n", " ");
-                                                    let preview = if oneline.chars().count() > 50 { 
-                                                        format!("{}...", oneline.chars().take(50).collect::<String>()) 
-                                                    } else { 
-                                                        oneline 
-                                                    };
-                                                    
-                                                    let resp = ui.label(egui::RichText::new(preview).weak().size(11.0));
-                                                    if resp.hovered() { egui::show_tooltip_text(ui.ctx(), ui.id(), &rep.text); }
-                                                });
+                                },
+                                F9Tab::Teleports => {
+                                    egui::ScrollArea::vertical().id_source("f9_tp_scroll").show(ui, |ui| {
+                                        egui::Grid::new("mp_tp_grid").striped(true).spacing([10.0, 10.0]).show(ui, |ui| {
+                                            let teleports = data::get_mp_teleports();
+                                            for (i, (name, coords)) in teleports.iter().enumerate() {
+                                                if ui.add_sized([250.0, 30.0], egui::Button::new(*name)).clicked() { run_teleport(ctx, *coords); } if (i + 1) % 2 == 0 { ui.end_row(); }
                                             }
-
-                                            
-                                            if let Some(idx) = to_remove {
-                                                replacements.remove(idx);
-                                            }
-                                        }
+                                        });
                                     });
-                                });
-
-                                
-                                columns[1].vertical(|ui| {
-                                    ui.heading(egui::RichText::new("🔧 Стандартные").color(accent_color));
-                                    ui.separator();
-                                    
-                                    egui::ScrollArea::vertical().id_source("system_rep_scroll").show(ui, |ui| {
-                                        
-                                        let total_width = ui.available_width();
-                                        
-                                        let width_bind = 50.0;
-                                        let width_desc = 180.0;
-                                        let width_text = (total_width - width_bind - width_desc - 30.0).max(100.0);
-
-                                        egui::Grid::new("sys_grid")
-                                            .striped(true)
-                                            .spacing([10.0, 10.0])
-                                            .min_col_width(50.0)
-                                            .show(ui, |ui| {
-                                                // Заголовки таблицы
-                                                ui.label(egui::RichText::new("Бинд").strong()); 
-                                                ui.label(egui::RichText::new("Описание").strong()); 
-                                                ui.label(egui::RichText::new("Текст").strong()); 
-                                                ui.end_row();
-                                                
-                                                if let Ok(mut replacements) = self.active_replacements.lock() {
-                                                    for rep in replacements.iter_mut() {
-                                                        if !rep.is_system { continue; }
-                                                        
-                                                        if !self.replace_search.is_empty() && !rep.label.to_lowercase().contains(&self.replace_search.to_lowercase()) {
-                                                            continue;
-                                                        }
-
-                                                        
-                                                        ui.add(egui::TextEdit::singleline(&mut rep.trigger).desired_width(width_bind).hint_text("..."));
-                                                        
-                                                        
-                                                        ui.add_sized([width_desc, 20.0], egui::Label::new(&rep.label).truncate(true));
-                                                        
-                                                        
-                                                        let oneline = rep.text.replace("\n", " ");
-                                                        
-                                                        let resp = ui.add_sized(
-                                                            [width_text, 20.0], 
-                                                            egui::Label::new(oneline).truncate(true)
-                                                        );
-                                                        
-                                                        if resp.hovered() { 
-                                                            egui::show_tooltip_text(ui.ctx(), ui.id(), &rep.text); 
-                                                        }
-                                                        
-                                                        ui.end_row();
-                                                    }
-                                                }
-                                            });
-                                    });
-                                });
-                            });
-                        },
-                        F6Tab::Events => {
-                            egui::ScrollArea::vertical().id_source("f6_events_scroll").show(ui, |ui| {
-                                ui.heading("📋 Порядок проведения мероприятия");
-                                ui.separator();
-                                ui.collapsing("1. Подготовка и Сбор", |ui| {
-                                    ui.label("1. Выберите место проведения (см. F9 Телепорты).");
-                                    ui.label("2. Переместитесь в дименшин и уведомить других администраторов (/dim 824151 3).");
-                                    ui.label("3. Спросите у других кто хочет участвовать на меропрятие.");
-                                    ui.label("4. Подготовьте все необходимое для проведения мероприятия.");
-                                });
-                                ui.collapsing("2. Начало мероприятия", |ui| {
-                                    ui.label("Откройте телепорт выставите кол-во игроков время проведение и название мероприятие (/gomp 30 30 Прятки)");
-                                    ui.label("После того как соберутся игроки нужно их выстрить и объяснить суть мероприятия.");
-                                    ui.label("Также объяснить что запрещено делать.");
-                                });
-                                ui.collapsing("3. Выдача экипировки", |ui| {
-                                    ui.label("1. Выдать все необходимые предметы для игроков.");
-                                    ui.label("2. Выдайте ХП и броню для игроков.");
-                                    ui.label("3. Начать мероприятие написав в чат мероприятие 'Начали!'.");
-                                });
-                                ui.collapsing("4. Финал и Приз", |ui| {
-                                    ui.label("1. Проследите за мероприятием и его нарушениеми");
-                                    ui.label("2. Закрыть димешшин.");
-                                    ui.label("3. После определние победителя - объявите его.");
-                                    ui.label("4. Отправить отчёт об проведённом мероприятии.");
-                                });
-                                ui.add_space(10.0);
-                                ui.label(egui::RichText::new("Примечание: Не забудьте что начало и конец мероприятие нужно скринить а также используйте F9 для автоматизации команд.").italics().color(accent_color));
-                            });
-                        },
-                        F6Tab::OrgManager => {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(10.0);
-                                ui.heading(egui::RichText::new("👔 Управление Фракцией").size(20.0).strong().color(accent_color));
-                            });
-                            
-                            ui.add_space(10.0);
-                            
-                            ui.group(|ui| {
-                                egui::Grid::new("org_grid")
-                                    .num_columns(2)
-                                    .spacing([15.0, 15.0])
-                                    .striped(true)
-                                    .show(ui, |ui| {
-                                        
-                                        ui.label(egui::RichText::new("👤 ID Игрока:").strong().color(accent_color));
-                                        ui.add(egui::TextEdit::singleline(&mut self.org_input_id)
-                                            .desired_width(120.0)
-                                            .hint_text("12156"));
-                                        ui.end_row();
-
-                                        ui.label(egui::RichText::new("🏰 Организация:").strong().color(accent_color));
-                                        let current_org_name = self.orgs[self.selected_org_index].name.clone();
-                                        egui::ComboBox::from_id_source("org_selector")
-                                            .selected_text(current_org_name)
-                                            .width(220.0)
-                                            .show_ui(ui, |ui| {
-                                                for (i, org) in self.orgs.iter().enumerate() { 
-                                                    if ui.selectable_value(&mut self.selected_org_index, i, &org.name).changed() { 
-                                                        self.selected_rank_index = 0; 
-                                                    } 
-                                                }
-                                            });
-                                        ui.end_row();
-
-                                        ui.label(egui::RichText::new("⭐ Ранг:").strong().color(accent_color));
-                                        let current_org = &self.orgs[self.selected_org_index];
-                                        if !current_org.ranks.is_empty() {
-                                            let current_rank_name = current_org.ranks[self.selected_rank_index].name.clone();
-                                            egui::ComboBox::from_id_source("rank_selector")
-                                                .selected_text(current_rank_name)
-                                                .width(220.0)
-                                                .show_ui(ui, |ui| {
-                                                    for (i, rank) in current_org.ranks.iter().enumerate() { 
-                                                        ui.selectable_value(&mut self.selected_rank_index, i, &rank.name); 
-                                                    }
-                                                });
-                                        } else { 
-                                            ui.label(egui::RichText::new("Нет рангов").italics()); 
-                                        }
-                                        ui.end_row();
-                                    });
-                            });
-
-                            ui.add_space(15.0);
-                            
-                            
-                            ui.vertical_centered(|ui| {
-                                
-                                let btn_text_color = if self.config.theme_mode == 1 { 
-                                    egui::Color32::BLACK 
-                                } else { 
-                                    egui::Color32::WHITE 
-                                };
-
-                                if ui.add_sized(
-                                    [180.0, 35.0], 
-                                    egui::Button::new(egui::RichText::new("ВЫДАТЬ РАНГ").strong().color(btn_text_color))
-                                ).clicked() {
-                                    let org = &self.orgs[self.selected_org_index];
-                                    if !org.ranks.is_empty() {
-                                        let rank = &org.ranks[self.selected_rank_index];
-                                        let cmd = format!("/setfactionrank {} {} {}", self.org_input_id, org.key, rank.id);
-                                        type_in_game(Some(ctx.clone()), cmd, true, true, None);
-                                    }
-                                }
-                            });
-                        },
-                        F6Tab::OnlineTimer => {
-                            let s = self.get_total_seconds();
-                            let hours = s / 3600;
-                            let mins = (s % 3600) / 60;
-                            let secs = s % 60;
-                            let time_str = format!("{:02}:{:02}:{:02}", hours, mins, secs);
-
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(15.0);
-                                
-                               
-                                if self.timer_paused {
-                                    ui.label(egui::RichText::new("💤 Таймер на паузе").color(egui::Color32::from_rgb(255, 200, 0))); // Желтый
-                                } else {
-                                    ui.label(egui::RichText::new("🔥 Таймер активен").color(accent_color)); // Цвет темы
-                                }
-
-                                ui.add_space(5.0);
-
-                                
-                                ui.label(egui::RichText::new(time_str)
-                                    .size(45.0) 
-                                    .strong()
-                                    .monospace()
-                                    .color(accent_color));
-
-                                ui.add_space(20.0);
-
-                                ui.horizontal(|ui| {
-                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center), |ui| {
-                                        
-                                        
-                                        let (btn_text, btn_icon) = if self.timer_paused { ("Продолжить", "▶") } else { ("Пауза", "⏸") };
-                                        
-                                        if ui.add_sized([130.0, 35.0], egui::Button::new(
-                                            format!("{} {}", btn_icon, btn_text)
-                                        )).clicked() { 
-                                            self.timer_paused = !self.timer_paused; 
-                                            if self.timer_paused { 
-                                                self.timer_saved_seconds += self.timer_start.elapsed().as_secs(); 
-                                            } else { 
-                                                self.timer_start = Instant::now(); 
-                                            } 
-                                        }
-
-                                        ui.add_space(10.0);
-
-                                        if ui.add_sized([130.0, 35.0], egui::Button::new("🔄 Сбросить")).clicked() { 
-                                            self.reset_timer(); 
-                                        }
-                                    });
-                                });
-                                
-                                ui.add_space(15.0);
-                                ui.separator();
-                                ui.label(egui::RichText::new("Автоматический сброс в 03:00 утра.").weak().size(12.0));
-                            });
-                        },
-                        F6Tab::BugReport => {
-                            egui::ScrollArea::vertical().id_source("bug_report_scroll").show(ui, |ui| {
-                                ui.heading("🐞 Регламент работы с багами");
-                                ui.separator();
-                                ui.label(egui::RichText::new("При фиксации бага администратор должен запросить у игрока:").strong().color(accent_color));
-                                ui.add_space(5.0);
-                                ui.label("1. Дату возникновения бага.");
-                                ui.label("2. Суть проблемы (текстовое описание).");
-                                ui.label("3. Доказательства (предпочтительно видео, в отдельных случаях скриншот).");
-                                ui.label("4. Логи (при серьёзных багах: бессмертие, бесконечные патроны, пропавшие текстуры, вылеты, ошибки).");
-
-                                ui.add_space(15.0);
-                                ui.heading("📂 Как выгрузить логи?");
-                                ui.label("Файлы логов находятся в папке RAGEMP по следующему пути:");
-                                ui.add_space(5.0);
-                                ui.monospace("RAGEMP\\clientdata\\console.txt");
-                                ui.monospace("RAGEMP\\clientdata\\cef_game_logs.txt");
-                                ui.monospace("RAGEMP\\clientdata\\cef_launcher_log.txt");
-                                ui.monospace("RAGEMP\\clientdata\\main_logs.txt");
-
-                                ui.add_space(15.0);
-                                ui.heading("📝 Порядок действий:");
-                                ui.label("1. Выдели все файлы (Ctrl + ЛКМ) и нажми правую кнопку мыши.");
-                                ui.label("2. Выбери «Добавить в архив» (WinRAR/7-Zip).");
-                                ui.label("3. Открой Google Диск и нажми «Создать».");
-                                ui.label("4. Выбери «Загрузить файлы» и дождись загрузки.");
-                                ui.label("5. Настрой доступ к файлу (доступ по ссылке).");
-                                ui.label("6. Отправь ссылку на архив с откатом в Discord, в канал #баг-репорт.");
-                            });
+                                },
+                            }
                         },
                     }
-                },
-                MainTab::PunishF7 => {
-                    ui.columns(2, |columns| {
-                        columns[0].vertical(|ui| {
-                            ui.horizontal(|ui| { ui.label("🔎"); ui.text_edit_singleline(&mut self.search_text); if !self.search_text.is_empty() && ui.button("X").clicked() { self.search_text.clear(); } }); ui.separator();
-                            egui::ScrollArea::vertical().id_source("f7_list_scroll").show(ui, |ui| {
-                                let query = self.search_text.to_lowercase();
-                                let mut picked_rule: Option<Rule> = None;
-                                for rule in &self.rules {
-                                    if query.is_empty() || rule.article.to_lowercase().contains(&query) || rule.title.to_lowercase().contains(&query) {
-                                        if ui.add_sized([ui.available_width(), 20.0], egui::Button::new(format!("{} - {}", rule.article, rule.title))).clicked() { picked_rule = Some(rule.clone()); }
-                                    }
-                                }
-                                if let Some(rule) = picked_rule { self.selected_rule = Some(rule); self.selected_punishment_idx = 0; self.update_punish_command(); }
-                            });
-                        });
-                        columns[1].vertical(|ui| {
-                            let current_rule = self.selected_rule.clone();
-                            if let Some(rule) = current_rule {
-                                ui.heading(format!("{} {}", rule.article, rule.title)); ui.separator();
-                                egui::ScrollArea::vertical().id_source("f7_desc_scroll").max_height(300.0).show(ui, |ui| { let clean_desc = rule.description.replace("`n", "\n");ui.label(egui::RichText::new(clean_desc).italics()); }); ui.separator();
-                                egui::Grid::new("punish_inputs").spacing([10.0, 10.0]).show(ui, |ui| {
-                                    ui.label("ID:"); if ui.add(egui::TextEdit::singleline(&mut self.input_id).desired_width(100.0)).changed() { self.update_punish_command(); } ui.end_row();
-                                    ui.label("Время:"); if ui.add(egui::TextEdit::singleline(&mut self.input_violation_time).desired_width(100.0)).changed() { self.update_punish_command(); } ui.end_row();
-                                    ui.label("ЖБ:"); if ui.add(egui::TextEdit::singleline(&mut self.input_report_num).desired_width(100.0)).changed() { self.update_punish_command(); } ui.end_row();
-                                }); ui.separator();
-                                let options = Self::get_rule_options(&rule);
-                                for (i, opt) in options.iter().enumerate() { if ui.radio_value(&mut self.selected_punishment_idx, i, &opt.label).changed() { self.update_punish_command(); } } ui.separator();
-                                ui.add_sized([ui.available_width(), 30.0], egui::TextEdit::multiline(&mut self.generated_punish_cmd));
-                                ui.horizontal(|ui| {
-                                    if ui.button("📋 Копировать").clicked() { if let Ok(mut clipboard) = Clipboard::new() { let _ = clipboard.set_text(self.generated_punish_cmd.clone()); } }
-                                    if ui.button("🚀 Выдать (Enter)").clicked() { type_in_game(Some(ctx.clone()), self.generated_punish_cmd.clone(), true, true, None); }
-                                });
-                            } else { ui.label("Выберите правило слева"); }
-                        });
-                    });
-                },
-                MainTab::TeleportF8 => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            ui.label("📂 Категория:");
-                            egui::ComboBox::from_id_source("tp_cat").selected_text(&self.teleport_category).width(180.0)
-                                .show_ui(ui, |ui| {
-                                     ui.selectable_value(&mut self.teleport_category, "Все события".to_string(), "Все события");
-                                     ui.selectable_value(&mut self.teleport_category, "Налёты".to_string(), "Налёты");
-                                     ui.selectable_value(&mut self.teleport_category, "Захват Районов".to_string(), "Захват Районов");
-                                     ui.selectable_value(&mut self.teleport_category, "Захват территорий".to_string(), "Захват территорий");
-                                     ui.selectable_value(&mut self.teleport_category, "Поставки, ограбление".to_string(), "Поставки");
-                                     ui.selectable_value(&mut self.teleport_category, "ВЗК, ВЗА".to_string(), "ВЗК, ВЗА");
-                                });
-                            ui.add_space(15.0);
-                            ui.label("🔍 Поиск:");
-                            ui.add(egui::TextEdit::singleline(&mut self.teleport_search).desired_width(120.0));
-                        });
-                    });
-                    ui.add_space(10.0); ui.separator(); ui.add_space(5.0);
-                    ui.scope(|ui| {
-                        let style = ui.style_mut();
-                        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(70));
-                        style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-                        style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-                        style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
-
-                        egui::ScrollArea::vertical().id_source("f8_tp_scroll").show(ui, |ui| {
-                                let spacing_x = 10.0;
-                                let btn_width = (ui.available_width() - spacing_x - 8.0) / 2.0;
-                                egui::Grid::new("tp_grid").num_columns(2).spacing([spacing_x, 10.0]).striped(true).show(ui, |ui| {
-                                        let query = self.teleport_search.to_lowercase();
-                                        let mut c = 0;
-                                        for tp in &self.teleport_list {
-                                            if (self.teleport_category == "Все события" || tp.category == self.teleport_category)
-                                                && (query.is_empty() || tp.name.to_lowercase().contains(&query))
-                                            {
-                                                let btn_text = egui::RichText::new(&tp.name).size(14.0);
-                                                if ui.add_sized([btn_width, 28.0], egui::Button::new(btn_text)).clicked() { run_teleport(ctx, &tp.command); }
-                                                c += 1;
-                                                if c % 2 == 0 { ui.end_row(); }
-                                            }
-                                        }
-                                });
-                        });
-                    });
-                },
-                MainTab::MpF9 => {
-                    ui.heading("Менеджер мероприятий"); ui.separator();
-                    ui.horizontal(|ui| { ui.selectable_value(&mut self.f9_tab, F9Tab::Commands, "Команды"); ui.selectable_value(&mut self.f9_tab, F9Tab::Teleports, "Телепорты"); }); ui.separator();
-
-                    let is_running = self.is_mp_running.load(Ordering::Relaxed);
-                    if is_running {
-                        ui.colored_label(egui::Color32::RED, "⏳ Выполняется команда... Подождите");
-                    }
-                    ui.set_enabled(!is_running);
-
-                    match self.f9_tab {
-                        F9Tab::Commands => {
-                            egui::ScrollArea::vertical().id_source("f9_cmd_scroll").show(ui, |ui| {
-                                egui::Grid::new("mp_c").striped(true).spacing([10.0, 10.0]).show(ui, |ui| {
-                                    let presets = data::get_mp_commands(&self.config.admin_id);
-                                    for (i, p) in presets.iter().enumerate() {
-                                        if ui.add_sized([250.0, 30.0], egui::Button::new(&p.button_name)).clicked() {
-                                            let cmds = p.commands.clone();
-                                            self.is_mp_running.store(true, Ordering::Relaxed);
-                                            let flag = self.is_mp_running.clone();
-
-                                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-
-                                            thread::spawn(move || {
-                                                 thread::sleep(Duration::from_millis(500));
-                                                 log("MP Thread: Starting commands execution...");
-                                                 for cmd in cmds {
-                                                     type_in_game(None, cmd, true, true, None);
-                                                     thread::sleep(Duration::from_millis(1500));
-                                                 }
-                                                 flag.store(false, Ordering::Relaxed);
-                                            });
-                                        }
-                                        if (i + 1) % 2 == 0 { ui.end_row(); }
-                                    }
-                                });
-                            });
-                        },
-                        F9Tab::Teleports => {
-                            egui::ScrollArea::vertical().id_source("f9_tp_scroll").show(ui, |ui| {
-                                egui::Grid::new("mp_tp_grid").striped(true).spacing([10.0, 10.0]).show(ui, |ui| {
-                                    let teleports = data::get_mp_teleports();
-                                    for (i, (name, coords)) in teleports.iter().enumerate() {
-                                        if ui.add_sized([250.0, 30.0], egui::Button::new(*name)).clicked() { run_teleport(ctx, *coords); } if (i + 1) % 2 == 0 { ui.end_row(); }
-                                    }
-                                });
-                            });
-                        },
-                    }
-                },
+                });
             }
-        });
+        }
     }
 }
 
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("AdminHelper")
+        .with_inner_size([750.0, 800.0])
+        .with_always_on_top();
+
+    
+    let icon_bytes = include_bytes!("../icon.png"); 
+    
+    match image::load_from_memory(icon_bytes) {
+        Ok(image) => {
+            let rgba = image.into_rgba8();
+            let (width, height) = rgba.dimensions();
+            
+            let icon_data = egui::IconData {
+                rgba: rgba.into_raw(),
+                width,
+                height,
+            };
+            viewport = viewport.with_icon(std::sync::Arc::new(icon_data));
+        },
+        Err(e) => {
+            println!("Ошибка загрузки иконки окна: {}", e);
+        }
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("AdminHelper")
-            .with_inner_size([750.0, 800.0])
-            .with_always_on_top(),
+        viewport,
         ..Default::default()
     };
+    
     eframe::run_native("AdminHelper", options, Box::new(|cc| Box::new(MyApp::new(cc))))
 }
